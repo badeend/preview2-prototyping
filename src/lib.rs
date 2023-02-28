@@ -1,10 +1,11 @@
 #![allow(unused_variables)] // TODO: remove this when more things are implemented
 
+#[cfg(not(feature = "command"))]
+use crate::bindings::wasi_console;
 use crate::bindings::{
     wasi_default_clocks, wasi_exit, wasi_filesystem, wasi_io, wasi_monotonic_clock, wasi_network,
-    wasi_poll, wasi_random, wasi_stderr, wasi_tcp, wasi_wall_clock,
+    wasi_poll, wasi_random, wasi_tcp, wasi_wall_clock,
 };
-use core::arch::wasm32;
 use core::cell::{Cell, RefCell, UnsafeCell};
 use core::cmp::min;
 use core::ffi::c_void;
@@ -533,7 +534,8 @@ pub unsafe extern "C" fn fd_fdstat_get(fd: Fd, stat: *mut Fdstat) -> Errno {
             });
             Ok(())
         }
-        Descriptor::Stderr => {
+        #[cfg(not(feature = "command"))]
+        Descriptor::Console(_) => {
             let fs_filetype = FILETYPE_UNKNOWN;
             let fs_flags = 0;
             let fs_rights_base = !RIGHTS_FD_READ;
@@ -872,7 +874,9 @@ pub unsafe extern "C" fn fd_read(
                     Ok(())
                 }
             }
-            Descriptor::Stderr | Descriptor::Closed(_) => Err(ERRNO_BADF),
+            Descriptor::Closed(_) => Err(ERRNO_BADF),
+            #[cfg(not(feature = "command"))]
+            Descriptor::Console(_) => Err(ERRNO_BADF),
         }
     })
 }
@@ -1237,8 +1241,14 @@ pub unsafe extern "C" fn fd_write(
                 *nwritten = bytes as usize;
                 Ok(())
             }
-            Descriptor::Stderr => {
-                wasi_stderr::print(bytes);
+            #[cfg(not(feature = "command"))]
+            Descriptor::Console(ctx) => {
+                // Written this way so rustc does not compile to a data initializer section
+                let ctx = match ctx {
+                    Console::Stdout => byte_array::str!("stdout"),
+                    Console::Stderr => byte_array::str!("stderr"),
+                };
+                wasi_console::log(wasi_console::Level::Info, &ctx, bytes);
                 *nwritten = len;
                 Ok(())
             }
@@ -2131,7 +2141,15 @@ enum Descriptor {
     /// Input and/or output wasi-streams, along with stream metadata.
     Streams(Streams),
 
-    /// Writes to `fd_write` will go to the `wasi-stderr` API.
+    #[cfg(not(feature = "command"))]
+    /// Writes to `fd_write` will go to the `wasi-console` logging API.
+    Console(Console),
+}
+
+#[cfg(not(feature = "command"))]
+#[repr(C)]
+enum Console {
+    Stdout,
     Stderr,
 }
 
@@ -2220,7 +2238,8 @@ impl Drop for Descriptor {
                     StreamType::EmptyStdin | StreamType::Unknown => {}
                 }
             }
-            Descriptor::Stderr => {}
+            #[cfg(not(feature = "command"))]
+            Descriptor::Console(_) => {}
             Descriptor::Closed(_) => {}
         }
     }
@@ -2511,11 +2530,36 @@ impl State {
             type_: StreamType::Unknown,
         }))
         .trapping_unwrap();
-        // Set up a default stdout, writing to the stderr device. This will
-        // be overridden when `command` is called.
-        self.push_desc(Descriptor::Stderr).trapping_unwrap();
-        // Set up a default stderr.
-        self.push_desc(Descriptor::Stderr).trapping_unwrap();
+
+        #[cfg(feature = "command")]
+        {
+            // Set up a default stdout. This will be overridden when `command`
+            // is called.
+            self.push_desc(Descriptor::Streams(Streams {
+                input: Cell::new(None),
+                output: Cell::new(None),
+                type_: StreamType::Unknown,
+            }))
+            .trapping_unwrap();
+            // Set up a default stderr. This will be overridden when `command`
+            // is called.
+            self.push_desc(Descriptor::Streams(Streams {
+                input: Cell::new(None),
+                output: Cell::new(None),
+                type_: StreamType::Unknown,
+            }))
+            .trapping_unwrap();
+        }
+
+        #[cfg(not(feature = "command"))]
+        {
+            // Stdout writes to the console
+            self.push_desc(Descriptor::Console(Console::Stdout))
+                .trapping_unwrap();
+            // Stderr writes to the console
+            self.push_desc(Descriptor::Console(Console::Stderr))
+                .trapping_unwrap();
+        }
     }
 
     fn push_desc(&self, desc: Descriptor) -> Result<Fd, Errno> {
@@ -2566,6 +2610,7 @@ impl State {
         match self.get(fd)? {
             Descriptor::Streams(streams) => Ok(streams),
             Descriptor::Closed(_) => Err(ERRNO_BADF),
+            #[cfg(not(feature = "command"))]
             _ => Err(error),
         }
     }
@@ -2612,14 +2657,18 @@ impl State {
     fn get_read_stream(&self, fd: Fd) -> Result<InputStream, Errno> {
         match self.get(fd)? {
             Descriptor::Streams(streams) => streams.get_read_stream(),
-            Descriptor::Closed(_) | Descriptor::Stderr => Err(ERRNO_BADF),
+            Descriptor::Closed(_) => Err(ERRNO_BADF),
+            #[cfg(not(feature = "command"))]
+            Descriptor::Console(_) => Err(ERRNO_BADF),
         }
     }
 
     fn get_write_stream(&self, fd: Fd) -> Result<OutputStream, Errno> {
         match self.get(fd)? {
             Descriptor::Streams(streams) => streams.get_write_stream(),
-            Descriptor::Closed(_) | Descriptor::Stderr => Err(ERRNO_BADF),
+            Descriptor::Closed(_) => Err(ERRNO_BADF),
+            #[cfg(not(feature = "command"))]
+            Descriptor::Console(_) => Err(ERRNO_BADF),
         }
     }
 

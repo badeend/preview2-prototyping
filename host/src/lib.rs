@@ -8,7 +8,6 @@ mod logging;
 mod network;
 mod poll;
 mod random;
-mod stderr;
 mod tcp;
 mod udp;
 pub use wasi_common::{table::Table, WasiCtx};
@@ -17,7 +16,7 @@ type HostResult<T, E> = anyhow::Result<Result<T, E>>;
 
 wasmtime::component::bindgen!({
     path: "../wit",
-    world: "wasi-command",
+    world: "wasi",
     tracing: true,
     async: true,
 });
@@ -31,7 +30,7 @@ pub fn add_to_linker<T: Send>(
     wasi_default_clocks::add_to_linker(l, f)?;
     wasi_filesystem::add_to_linker(l, f)?;
     wasi_logging::add_to_linker(l, f)?;
-    wasi_stderr::add_to_linker(l, f)?;
+    wasi_console::add_to_linker(l, f)?;
     wasi_poll::add_to_linker(l, f)?;
     wasi_io::add_to_linker(l, f)?;
     wasi_random::add_to_linker(l, f)?;

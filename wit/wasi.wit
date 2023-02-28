@@ -3,8 +3,7 @@ default world wasi {
   import wasi-wall-clock: pkg.wasi-wall-clock
   import wasi-timezone: pkg.wasi-timezone
   import wasi-default-clocks: pkg.wasi-default-clocks.wasi-default-clocks
-  import wasi-logging: pkg.wasi-logging
-  import wasi-stderr: pkg.wasi-stderr
+  import wasi-console: pkg.wasi-logging
   import wasi-filesystem: pkg.wasi-filesystem
   import wasi-random: pkg.wasi-random
   import wasi-poll: pkg.wasi-poll

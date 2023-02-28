@@ -4,7 +4,6 @@ default world wasi-command {
   import wasi-timezone: pkg.wasi-timezone
   import wasi-default-clocks: pkg.wasi-default-clocks.wasi-default-clocks
   import wasi-logging: pkg.wasi-logging
-  import wasi-stderr: pkg.wasi-stderr
   import wasi-filesystem: pkg.wasi-filesystem
   import wasi-random: pkg.wasi-random
   import wasi-poll: pkg.wasi-poll
@@ -20,6 +19,7 @@ default world wasi-command {
   export command: func(
     stdin: u32, // TODO `use` from `wasi-io`
     stdout: u32, // TODO: `use` from `wasi-io`
+    stderr: u32, // TODO: `use` from `wasi-io`
     args: list<string>,
   ) -> result
 }

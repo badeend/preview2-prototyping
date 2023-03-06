@@ -47,6 +47,7 @@ mod bindings {
 pub unsafe extern "C" fn command(
     stdin: InputStream,
     stdout: OutputStream,
+    stderr: OutputStream,
     args_ptr: *const WasmStr,
     args_len: usize,
 ) -> u32 {
@@ -67,6 +68,11 @@ pub unsafe extern "C" fn command(
             descriptors[1] = Descriptor::Streams(Streams {
                 input: Cell::new(None),
                 output: Cell::new(Some(stdout)),
+                type_: StreamType::Unknown,
+            });
+            descriptors[2] = Descriptor::Streams(Streams {
+                input: Cell::new(None),
+                output: Cell::new(Some(stderr)),
                 type_: StreamType::Unknown,
             });
         }

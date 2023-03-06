@@ -1,10 +1,10 @@
-use crate::{wasi_logging, WasiCtx};
+use crate::{wasi_console, WasiCtx};
 
 #[async_trait::async_trait]
-impl wasi_logging::WasiLogging for WasiCtx {
+impl wasi_console::WasiConsole for WasiCtx {
     async fn log(
         &mut self,
-        level: wasi_logging::Level,
+        level: wasi_console::Level,
         context: String,
         message: String,
     ) -> anyhow::Result<()> {

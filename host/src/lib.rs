@@ -6,7 +6,6 @@ mod filesystem;
 mod http_types;
 mod io;
 mod ip_name_lookup;
-mod logging;
 mod network;
 mod poll;
 mod random;

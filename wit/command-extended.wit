@@ -19,13 +19,13 @@ default world command-extended {
   import preopens: pkg.preopens
   import exit: pkg.exit
 
-  // We should replace all others with `include self.command`
+  export run: func() -> result
+
+  // This is intended to be a simple extension of the command world to
+  // include the outgoing http interface.
+  // We should replace the above members with `include self.command`
   // as soon as the unioning of worlds is available:
   // https://github.com/WebAssembly/component-model/issues/169
-  import console: logging.handler
   import default-outgoing-HTTP: http.outgoing-handler
 
-  export main: func(
-    args: list<string>,
-  ) -> result
 }

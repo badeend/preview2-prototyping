@@ -1,6 +1,20 @@
 default world proxy {
+
+  // all imports available in `reactor`, except for tcp/udp networking:
+  import wall-clock: clocks.wall-clock
+  import monotonic-clock: clocks.monotonic-clock
+  import instance-wall-clock: clocks.instance-wall-clock
+  import instance-monotonic-clock: clocks.instance-monotonic-clock
+  import timezone: clocks.timezone
+  import filesystem: filesystem.filesystem
+
   import random: random.random
-  import console: logging.handler
+  import poll: poll.poll
+  import streams: io.streams
   import default-outgoing-HTTP: http.outgoing-handler
+  import environment: pkg.environment
+  import preopens: pkg.preopens
+  import exit: pkg.exit
+
   export HTTP: http.incoming-handler
 }

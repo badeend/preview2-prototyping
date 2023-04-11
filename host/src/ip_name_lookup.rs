@@ -1,8 +1,8 @@
 #![allow(unused_variables)]
 
 use crate::{
-    command::wasi::ip_name_lookup::{self, ResolveAddressStream},
-    command::wasi::network::{Error, IpAddress, IpAddressFamily, Network},
+    command::wasi::{ip_name_lookup::{self, ResolveAddressStream}, network::ErrorCode},
+    command::wasi::network::{IpAddress, IpAddressFamily, Network},
     command::wasi::poll::Pollable,
     HostResult, WasiCtx,
 };
@@ -15,14 +15,14 @@ impl ip_name_lookup::Host for WasiCtx {
         name: String,
         address_family: Option<IpAddressFamily>,
         include_unavailable: bool,
-    ) -> HostResult<ResolveAddressStream, Error> {
+    ) -> HostResult<ResolveAddressStream, ErrorCode> {
         todo!()
     }
 
     async fn resolve_next_address(
         &mut self,
         stream: ResolveAddressStream,
-    ) -> HostResult<Option<IpAddress>, Error> {
+    ) -> HostResult<Option<IpAddress>, ErrorCode> {
         todo!()
     }
 
@@ -30,18 +30,6 @@ impl ip_name_lookup::Host for WasiCtx {
         &mut self,
         stream: ResolveAddressStream,
     ) -> anyhow::Result<()> {
-        todo!()
-    }
-
-    async fn non_blocking(&mut self, stream: ResolveAddressStream) -> HostResult<bool, Error> {
-        todo!()
-    }
-
-    async fn set_non_blocking(
-        &mut self,
-        stream: ResolveAddressStream,
-        value: bool,
-    ) -> HostResult<(), Error> {
         todo!()
     }
 

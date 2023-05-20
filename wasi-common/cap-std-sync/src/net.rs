@@ -1,11 +1,9 @@
 use cap_std::net::{Pool, Shutdown, SocketAddr, TcpListener, TcpStream};
 use io_extras::borrowed::BorrowedReadable;
-#[cfg(windows)]
-use io_extras::os::windows::{AsHandleOrSocket, BorrowedHandleOrSocket};
-use io_lifetimes::AsSocketlike;
-#[cfg(windows)]
-use io_lifetimes::{AsSocket, BorrowedSocket};
-use rustix::fd::{AsFd, BorrowedFd, OwnedFd};
+use io_lifetimes::{AsSocketlike, AsFd};
+use rustix::fd::BorrowedFd;
+use socket2::{Domain, Protocol, Socket};
+use wasi_common::network::NetworkError;
 use std::any::Any;
 use std::convert::TryInto;
 use std::io::{self, Read, Write};
@@ -13,7 +11,7 @@ use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 #[cfg(windows)]
 use std::os::windows::io::AsRawSocket;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::sync::Mutex;
 use system_interface::io::{IoExt, IsReadWrite, ReadReady};
 use wasi_common::{
@@ -24,18 +22,111 @@ use wasi_common::{
     Error, ErrorExt,
 };
 
-/// Adapt between wasi-sockets where socket/bind/listen/accept are all separate
-/// steps and std/cap-std where they're combined.
-enum TcpSocketImpl {
-    Init(AddressFamily),
-    Bound(Pool, SocketAddr),
-    Listening(TcpListener),
-    Sock(OwnedFd),
+struct Binding {
+    network: Box<dyn WasiNetwork>,
+    local_address: SocketAddr,
+}
+
+enum TcpState {
+    Indeterminate {
+        listen_backlog_size: u64,
+        binding: Option<Binding>,
+        active_operation: Option<TcpOperation>,
+    },
+    Listener {
+        binding: Binding,
+    },
+    Connection {
+        binding: Binding,
+        remote_address: SocketAddr,
+    }
+}
+
+/// An in progress operation and its arguments.
+enum TcpOperation {
+    Bind {
+        network: Box<dyn WasiNetwork>,
+        local_address: SocketAddr,
+    },
+    Listen {
+        network: Box<dyn WasiNetwork>,
+    },
+    Connect {
+        network: Box<dyn WasiNetwork>,
+        remote_address: SocketAddr,
+    }
+}
+
+struct TcpSocketImpl {
+    native: Socket,
+    address_family: AddressFamily,
+    state: TcpState,
+}
+
+impl TcpSocketImpl {
+    fn binding(&self) -> Option<&Binding> {
+        match self.state {
+            TcpState::Indeterminate { binding, .. } => binding.as_ref(),
+            TcpState::Listener { binding } => Some(&binding),
+            TcpState::Connection { binding, .. } => Some(&binding),
+        }
+    }
+
+    fn active_operation(&self) -> Option<&TcpOperation> {
+        match self.state {
+            TcpState::Indeterminate { active_operation, .. } => active_operation.as_ref(),
+            TcpState::Listener { .. } => None,
+            TcpState::Connection { .. } => None,
+        }
+    }
+
+    fn validate_not_bound(&self) -> Result<(), NetworkError> {
+        match self.binding() {
+            Some(_) => Ok(()),
+            None => Err(NetworkError::AlreadyBound),
+        }
+    }
+
+    fn validate_connected(&self) -> Result<(), NetworkError> {
+        match self.state {
+            TcpState::Indeterminate { .. } |
+            TcpState::Listener { .. } => Err(NetworkError::NotConnected),
+            TcpState::Connection { .. } => Ok(()),
+        }
+    }
+
+    fn validate_not_connected(&self) -> Result<(), NetworkError> {
+        match self.state {
+            TcpState::Indeterminate { .. } |
+            TcpState::Listener { .. } => Ok(()),
+            TcpState::Connection { .. } => Err(NetworkError::AlreadyConnected),
+        }
+    }
+
+    /// Enforce consistent cross-platform behaviour.
+    /// 
+    /// From: https://learn.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-connect
+    /// > If the connection is not completed immediately, the client should wait for connection
+    /// > completion before attempting to set socket options using setsockopt. Calling setsockopt
+    /// > while a connection is in progress is not supported.
+    fn validate_no_active_operation(&self) -> Result<(), NetworkError> {
+        match self.active_operation() {
+            Some(_) => Ok(()),
+            None => Err(NetworkError::ConcurrencyConflict),
+        }
+    }
+
+    fn validate_is_ipv6(&self) -> Result<(), NetworkError> {
+        match self.address_family {
+            AddressFamily::INET6 => Ok(()),
+            _ => Err(NetworkError::Ipv6OnlyOperation)
+        }
+    }
 }
 
 pub struct Network(Pool);
-pub struct TcpSocket(Arc<Mutex<TcpSocketImpl>>);
-pub struct UdpSocket(Arc<OwnedFd>);
+pub struct TcpSocket(Arc<RwLock<TcpSocketImpl>>);
+pub struct UdpSocket(Arc<Socket>);
 
 impl Network {
     pub fn new(pool: Pool) -> Self {
@@ -44,23 +135,97 @@ impl Network {
 }
 
 impl TcpSocket {
-    pub fn new(family: AddressFamily) -> Self {
-        Self(Arc::new(Mutex::new(TcpSocketImpl::Init(family))))
-    }
+    pub fn new(address_family: AddressFamily) -> Result<Self, NetworkError> {
 
-    pub fn sock(fd: OwnedFd) -> Self {
-        Self(Arc::new(Mutex::new(TcpSocketImpl::Sock(fd))))
+        let domain = match address_family {
+            AddressFamily::INET => Domain::IPV4,
+            AddressFamily::INET6 => Domain::IPV6,
+        };
+
+        // socket2 automatically sets:
+        // - SOCK_CLOEXEC on Unix. And SO_NOSIGPIPE on Apple platforms.
+        // - WSA_FLAG_NO_HANDLE_INHERIT and WSA_FLAG_OVERLAPPED on Windows.
+        let native = Socket::new(domain, socket2::Type::STREAM, Some(Protocol::TCP)).map_err(|err| match err {
+            // AFNOSUPPORT => NetworkError::AddressFamilyNotSupported, // TODO
+            // MFILE => NetworkError::NewSocketLimit, // TODO
+            // NFILE => NetworkError::NewSocketLimit, // TODO
+            _ => map_general_error(err),
+        })?;
+
+        Ok(Self(Arc::new(RwLock::new(TcpSocketImpl {
+            native,
+            address_family,
+            state: TcpState::Indeterminate {
+                listen_backlog_size: 1024,
+                binding: None,
+                active_operation: None,
+            },
+        }))))
+        
     }
 
     pub fn clone(&self) -> Self {
         Self(Arc::clone(&self.0))
     }
+
+    fn for_reading(&self) -> RwLockReadGuard<TcpSocketImpl> {
+        self.0.read().unwrap()
+    }
+
+    fn for_writing(&self) -> RwLockWriteGuard<TcpSocketImpl> {
+        self.0.write().unwrap()
+    }
+}
+
+impl From<TcpListener> for TcpSocket {
+    fn from(listener: TcpListener) -> Self {
+
+        let local_address = listener.local_addr().unwrap();
+
+        Self(Arc::new(RwLock::new(TcpSocketImpl {
+            native: listener.into(),
+            address_family: local_address.into(),
+            state: TcpState::Listener {
+                binding: Binding {
+                    network: todo!(), // TODO: an already listening socket doesn't need a network anymore?
+                    local_address: local_address.into(),
+                },
+            },
+        })))
+    }
+}
+
+impl From<TcpStream> for TcpSocket {
+    fn from(stream: TcpStream) -> Self {
+
+        let local_address = stream.local_addr().unwrap();
+        let remote_address = stream.peer_addr().unwrap();
+
+        Self(Arc::new(RwLock::new(TcpSocketImpl {
+            native: stream.into(),
+            address_family: local_address.into(),
+            state: TcpState::Connection {
+                remote_address: remote_address.into(),
+                binding: Binding {
+                    network: todo!(), // TODO: an already connected socket doesn't need a network anymore?
+                    local_address: local_address.into(),
+                },
+            },
+        })))
+    }
+}
+
+impl From<Socket> for TcpSocket {
+    fn from(native: Socket) -> Self {
+
+        // if has remote address: Connection
+        // else if SO_ACCEPTCONN: Listener
+        // else if has local address: Bound
+        // else: Indeterminate
+    }
 }
 
 impl UdpSocket {
-    pub fn new(owned: OwnedFd) -> Self {
-        Self(Arc::new(owned))
-    }
 
     pub fn clone(&self) -> Self {
         Self(Arc::clone(&self.0))
@@ -77,164 +242,207 @@ impl WasiTcpSocket for TcpSocket {
         self.as_fd()
     }
 
-    async fn bind(
-        &self,
-        network: &dyn WasiNetwork,
-        local_address: SocketAddr,
-    ) -> Result<(), Error> {
-        let mut sock = self.0.lock().unwrap();
-        match &mut *sock {
-            TcpSocketImpl::Init(family) => {
-                // Check that the requested family matches the address.
-                match (local_address, *family) {
-                    (SocketAddr::V4(_), AddressFamily::INET)
-                    | (SocketAddr::V6(_), AddressFamily::INET6) => {}
-                    _ => return Err(Error::invalid_argument()),
-                }
+    async fn bind(&self, network: &dyn WasiNetwork, local_address: SocketAddr) -> Result<(), NetworkError> {
 
-                *sock = TcpSocketImpl::Bound(network.pool().clone(), local_address);
+        // TODO: set SO_EXCLUSIVEADDRUSE on Windows
+
+        todo!()
+    }
+
+    async fn connect(&self, network: &dyn WasiNetwork, remote_address: SocketAddr) -> Result<(Box<dyn InputStream>, Box<dyn OutputStream>), NetworkError> {
+        todo!()
+    }
+
+    async fn listen(&self, network: &dyn WasiNetwork) -> Result<(), NetworkError> {
+        todo!()
+    }
+
+    fn accept(&self) -> Result<(Box<dyn WasiTcpSocket>, Box<dyn InputStream>, Box<dyn OutputStream>), NetworkError> {
+        todo!()
+    }
+
+    fn local_address(&self) -> Result<SocketAddr, NetworkError> {
+        let sock = self.for_reading();
+
+        sock.binding().map(|b| b.local_address).ok_or(NetworkError::NotBound)
+    }
+
+    fn remote_address(&self) -> Result<SocketAddr, NetworkError> {
+        let sock = self.for_reading();
+
+        match sock.state {
+            TcpState::Connection { remote_address, .. } => Ok(remote_address),
+            TcpState::Indeterminate { .. } => Err(NetworkError::NotConnected),
+            TcpState::Listener { .. } => Err(NetworkError::NotConnected),
+        }
+    }
+
+    fn address_family(&self) -> AddressFamily {
+        self.for_reading().address_family
+    }
+
+    fn ipv6_only(&self) -> Result<bool, NetworkError> {
+        let sock = self.for_reading();
+
+        sock.validate_is_ipv6()?;
+
+        sock.native.only_v6().map_err(|e| NetworkError::NotSupported)
+    }
+
+    fn set_ipv6_only(&self, value: bool) -> Result<(), NetworkError> {
+        let sock = self.for_writing();
+
+        sock.validate_is_ipv6()?;
+        sock.validate_not_bound()?;
+        sock.validate_no_active_operation()?;
+
+        sock.native.set_only_v6(value).map_err(|e| NetworkError::NotSupported)
+    }
+
+    fn set_listen_backlog_size(&self, value: u64) -> Result<(), NetworkError> {
+        let mut sock = self.for_writing();
+
+        sock.validate_no_active_operation()?;
+
+        match sock.state {
+            TcpState::Indeterminate { ref mut listen_backlog_size, .. } => {
+                *listen_backlog_size = value;
+
                 Ok(())
-            }
-            TcpSocketImpl::Listening(_) | TcpSocketImpl::Bound(_, _) | TcpSocketImpl::Sock(_) => {
-                Err(Error::invalid_argument())
-            }
-        }
-    }
+            },
+            TcpState::Listener { .. } => {
 
-    async fn listen(
-        &self,
-        _network: &dyn WasiNetwork, // FIXME: Can we remove this from the wit?
-    ) -> Result<(), Error> {
-        let mut sock = self.0.lock().unwrap();
-        match &mut *sock {
-            TcpSocketImpl::Init(_) => {
-                // No address to bind to.
-                Err(Error::destination_address_required())
-            }
-            TcpSocketImpl::Bound(pool, local_addr) => {
-                let listener = pool.bind_tcp_listener(*local_addr)?;
-                *sock = TcpSocketImpl::Listening(listener);
+                // Call `listen` again with the updated value. Platforms that don't support this return an error, which we'll ignore.
+                _ = sock.native.listen(i32::try_from(value).unwrap_or(i32::MAX));
+
                 Ok(())
-            }
-            TcpSocketImpl::Listening(_) => {
-                // Already listening.
-                Err(Error::invalid_argument())
-            }
-            TcpSocketImpl::Sock(_) => {
-                // Already bound.
-                Err(Error::invalid_argument())
-            }
+            },
+            TcpState::Connection { .. } => Err(NetworkError::AlreadyConnected),
         }
     }
 
-    async fn accept(
-        &self,
-        nonblocking: bool,
-    ) -> Result<
-        (
-            Box<dyn WasiTcpSocket>,
-            Box<dyn InputStream>,
-            Box<dyn OutputStream>,
-            SocketAddr,
-        ),
-        Error,
-    > {
-        let mut sock = self.0.lock().unwrap();
-        match &mut *sock {
-            TcpSocketImpl::Listening(listener) => {
-                let (connection, addr) = listener.accept()?;
-                connection.set_nonblocking(nonblocking)?;
-                let connection = TcpSocket::sock(connection.into());
-                let input_stream = connection.clone();
-                let output_stream = connection.clone();
-                Ok((
-                    Box::new(connection),
-                    Box::new(input_stream),
-                    Box::new(output_stream),
-                    addr,
-                ))
-            }
-            TcpSocketImpl::Init(_) | TcpSocketImpl::Bound(_, _) | TcpSocketImpl::Sock(_) => {
-                Err(Error::invalid_argument())
-            }
+    fn keep_alive(&self) -> Result<bool, NetworkError> {
+        let sock = self.for_reading();
+
+        sock.native.keepalive().map_err(|e| NetworkError::NotSupported)
+    }
+
+    fn set_keep_alive(&self, value: bool) -> Result<(), NetworkError> {
+        let sock = self.for_writing();
+
+        sock.validate_no_active_operation()?;
+
+        sock.native.set_keepalive(value).map_err(|e| NetworkError::NotSupported)
+    }
+
+    fn no_delay(&self) -> Result<bool, NetworkError> {
+        let sock = self.for_reading();
+
+        sock.native.nodelay().map_err(|e| NetworkError::NotSupported)
+    }
+
+    fn set_no_delay(&self, value: bool) -> Result<(), NetworkError> {
+        let sock = self.for_writing();
+
+        sock.validate_no_active_operation()?;
+
+        sock.native.set_nodelay(value).map_err(|e| NetworkError::NotSupported)
+    }
+
+    fn unicast_hop_limit(&self) -> Result<u8, NetworkError> {
+        let sock = self.for_reading();
+
+        match sock.address_family {
+            AddressFamily::INET => sock.native.ttl().map(|t| u8::try_from(t).unwrap()).map_err(|e| NetworkError::NotSupported),
+            AddressFamily::INET6 => sock.native.unicast_hops_v6().map(|t| u8::try_from(t).unwrap()).map_err(|e| NetworkError::NotSupported),
         }
     }
 
-    async fn connect(
-        &self,
-        network: &dyn WasiNetwork,
-        remote_address: SocketAddr,
-    ) -> Result<(Box<dyn InputStream>, Box<dyn OutputStream>), Error> {
-        let connection = network.pool().connect_tcp_stream(remote_address)?;
-        let connection = TcpSocket::sock(connection.into());
-        let input_stream = connection.clone();
-        let output_stream = connection.clone();
-        Ok((Box::new(input_stream), Box::new(output_stream)))
-    }
+    fn set_unicast_hop_limit(&self, value: u8) -> Result<(), NetworkError> {
+        let sock = self.for_writing();
 
-    async fn shutdown(&self, how: Shutdown) -> Result<(), Error> {
-        self.as_socketlike_view::<TcpStream>().shutdown(how)?;
-        Ok(())
-    }
+        sock.validate_no_active_operation()?;
 
-    fn local_address(&self) -> Result<SocketAddr, Error> {
-        Ok(self.as_socketlike_view::<TcpStream>().local_addr()?)
-    }
+        // Enforce consistent cross-platform behaviour. From https://learn.microsoft.com/en-us/dotnet/api/system.net.sockets.socket.ttl :
+        // > Setting this property on a Transmission Control Protocol (TCP) socket is ignored by
+        // > the TCP/IP stack if a successful connection has been established using the socket.
+        sock.validate_not_connected()?;
 
-    fn remote_address(&self) -> Result<SocketAddr, Error> {
-        Ok(self.as_socketlike_view::<TcpStream>().peer_addr()?)
-    }
-
-    fn nodelay(&self) -> Result<bool, Error> {
-        let value = self.as_socketlike_view::<TcpStream>().nodelay()?;
-        Ok(value)
-    }
-
-    fn set_nodelay(&self, flag: bool) -> Result<(), Error> {
-        self.as_socketlike_view::<TcpStream>().set_nodelay(flag)?;
-        Ok(())
-    }
-
-    fn v6_only(&self) -> Result<bool, Error> {
-        let value = rustix::net::sockopt::get_ipv6_v6only(self).map_err(std::io::Error::from)?;
-        Ok(value)
-    }
-
-    fn set_v6_only(&self, value: bool) -> Result<(), Error> {
-        rustix::net::sockopt::set_ipv6_v6only(self, value).map_err(std::io::Error::from)?;
-        Ok(())
-    }
-
-    fn set_nonblocking(&mut self, flag: bool) -> Result<(), Error> {
-        self.as_socketlike_view::<TcpStream>()
-            .set_nonblocking(flag)?;
-        Ok(())
-    }
-
-    async fn readable(&self) -> Result<(), Error> {
-        let sock = self.0.lock().unwrap();
-        let sock = match &*sock {
-            TcpSocketImpl::Sock(sock) => sock,
-            _ => return Err(Error::invalid_argument()),
-        };
-        if is_read_write(&sock)?.0 {
-            Ok(())
-        } else {
-            Err(Error::badf())
+        match sock.address_family {
+            AddressFamily::INET => sock.native.set_ttl(u32::from(value)).map_err(|e| NetworkError::NotSupported),
+            AddressFamily::INET6 => sock.native.set_unicast_hops_v6(u32::from(value)).map_err(|e| NetworkError::NotSupported),
         }
     }
 
-    async fn writable(&self) -> Result<(), Error> {
-        let sock = self.0.lock().unwrap();
-        let sock = match &*sock {
-            TcpSocketImpl::Sock(sock) => sock,
-            _ => return Err(Error::invalid_argument()),
-        };
-        if is_read_write(&sock)?.1 {
-            Ok(())
-        } else {
-            Err(Error::badf())
-        }
+    fn receive_buffer_size(&self) -> Result<u64, NetworkError> {
+
+        let sock = self.for_reading();
+
+        sock.native.recv_buffer_size().map(|t| u64::try_from(t).unwrap_or(u64::MAX)).map_err(|e| NetworkError::NotSupported)
+    }
+
+    fn set_receive_buffer_size(&self, value: u64) -> Result<(), NetworkError> {
+        let sock = self.for_writing();
+
+        sock.validate_no_active_operation()?;
+
+        let normalized_value = normalize_set_buffer_size(value);
+
+        sock.native.set_recv_buffer_size(usize::try_from(normalized_value).unwrap()).map_err(|e| NetworkError::NotSupported)
+    }
+
+    fn send_buffer_size(&self) -> Result<u64, NetworkError> {
+        let sock = self.for_reading();
+
+        sock.native.send_buffer_size().map(|t| u64::try_from(t).unwrap_or(u64::MAX)).map_err(|e| NetworkError::NotSupported)
+    }
+
+    fn set_send_buffer_size(&self, value: u64) -> Result<(), NetworkError> {
+        let sock = self.for_writing();
+
+        sock.validate_no_active_operation()?;
+
+        let normalized_value = normalize_set_buffer_size(value);
+
+        sock.native.set_send_buffer_size(usize::try_from(normalized_value).unwrap()).map_err(|e| NetworkError::NotSupported)
+    }
+
+    fn shutdown(&self, how: Shutdown) -> Result<(), NetworkError> {
+        let sock = self.for_writing();
+
+        sock.validate_no_active_operation()?;
+        sock.validate_connected()?;
+
+        sock.native.shutdown(how).map_err(|e| NetworkError::NotSupported)
+
+        // TODO: Ensure that all subsequent read operations on the `input-stream` associated with this socket will return an End Of Stream indication.
+        // TODO: Ensure that all subsequent write operations on the `output-stream` associated with this socket will return an error.
+    }
+}
+
+fn normalize_set_buffer_size(value: u64) -> u64 {
+    let value = if cfg!(target_os = "linux") {
+        // From https://man7.org/linux/man-pages/man7/socket.7.html:
+        // > The kernel doubles this value (to allow space for bookkeeping overhead) when it is set
+        // > using setsockopt(2), and this doubled value is returned by getsockopt(2).
+
+        value / 2
+    } else {
+        value
+    };
+
+    value.max(1)
+}
+
+fn map_general_error(errno: io::Error) -> NetworkError {
+    match errno {
+        // ACCESS => NetworkError::AccessDenied, // TODO
+        // PERM => NetworkError::AccessDenied, // TODO
+        // NOTSUP => NetworkError::NotSupported, // TODO
+        // OPNOTSUPP => NetworkError::NotSupported, // TODO
+        // NOMEM => NetworkError::OutOfMemory, // TODO
+        // NOBUFS => NetworkError::OutOfMemory, // TODO
+        _ => NetworkError::Unknown,
     }
 }
 
@@ -443,15 +651,7 @@ impl WasiNetwork for Network {
 #[cfg(unix)]
 impl AsFd for TcpSocket {
     fn as_fd(&self) -> BorrowedFd<'_> {
-        let sock = self.0.lock().unwrap();
-        let raw_fd = match &*sock {
-            TcpSocketImpl::Sock(sock) => sock.as_fd().as_raw_fd(),
-            TcpSocketImpl::Listening(listener) => listener.as_fd().as_raw_fd(),
-            _ => panic!(),
-        };
-        // SAFETY: Once we switch to `TcpSocketImpl::Sock`, we never
-        // switch back to `Init` or switch the file descriptor out.
-        unsafe { BorrowedFd::borrow_raw(raw_fd) }
+        self.0.socket.as_fd()
     }
 }
 

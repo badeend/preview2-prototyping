@@ -1,6 +1,7 @@
 //! TCP sockets.
 
 use crate::Error;
+use crate::network::{NetworkError, AddressFamily};
 use crate::{InputStream, OutputStream, WasiNetwork};
 use cap_std::net::{Shutdown, SocketAddr};
 use std::any::Any;
@@ -8,61 +9,58 @@ use std::any::Any;
 /// A TCP socket.
 #[async_trait::async_trait]
 pub trait WasiTcpSocket: Send + Sync {
+
     fn as_any(&self) -> &dyn Any;
 
     /// Return the host file descriptor so that it can be polled with a host poll.
     fn pollable(&self) -> rustix::fd::BorrowedFd;
 
-    async fn listen(&self, network: &dyn WasiNetwork) -> Result<(), Error>;
+    async fn bind(&mut self, network: &impl WasiNetwork, local_address: SocketAddr) -> Result<(), NetworkError>;
 
-    async fn accept(
-        &self,
-        nonblocking: bool,
-    ) -> Result<
-        (
-            Box<dyn WasiTcpSocket>,
-            Box<dyn InputStream>,
-            Box<dyn OutputStream>,
-            SocketAddr,
-        ),
-        Error,
-    >;
+    async fn connect(&mut self, network: &impl WasiNetwork, remote_address: SocketAddr) -> Result<(Box<dyn InputStream>, Box<dyn OutputStream>), NetworkError>;
 
-    async fn connect(
-        &self,
-        network: &dyn WasiNetwork,
-        remote_address: SocketAddr,
-    ) -> Result<(Box<dyn InputStream>, Box<dyn OutputStream>), Error>;
+    async fn listen(&mut self, network: &impl WasiNetwork) -> Result<(), NetworkError>;
 
-    async fn bind(&self, network: &dyn WasiNetwork, local_address: SocketAddr)
-        -> Result<(), Error>;
+    fn accept(&self) -> Result<(Self, Box<dyn InputStream>, Box<dyn OutputStream>), NetworkError>;
 
-    async fn shutdown(&self, how: Shutdown) -> Result<(), Error>;
+    fn local_address(&self) -> Result<SocketAddr, NetworkError>;
+    fn remote_address(&self) -> Result<SocketAddr, NetworkError>;
 
-    fn local_address(&self) -> Result<SocketAddr, Error>;
-    fn remote_address(&self) -> Result<SocketAddr, Error>;
+    fn address_family(&self) -> AddressFamily;
 
-    fn nodelay(&self) -> Result<bool, Error>;
-    fn set_nodelay(&self, value: bool) -> Result<(), Error>;
-    fn v6_only(&self) -> Result<bool, Error>;
-    fn set_v6_only(&self, value: bool) -> Result<(), Error>;
+    fn ipv6_only(&self) -> Result<bool, NetworkError>;
+    fn set_ipv6_only(&mut self, value: bool) -> Result<(), NetworkError>;
 
-    fn set_nonblocking(&mut self, flag: bool) -> Result<(), Error>;
+    fn set_listen_backlog_size(&mut self, value: u64) -> Result<(), NetworkError>;
 
-    async fn readable(&self) -> Result<(), Error>;
+    fn keep_alive(&self) -> Result<bool, NetworkError>;
+    fn set_keep_alive(&mut self, value: bool) -> Result<(), NetworkError>;
 
-    async fn writable(&self) -> Result<(), Error>;
+    fn no_delay(&self) -> Result<bool, NetworkError>;
+    fn set_no_delay(&mut self, value: bool) -> Result<(), NetworkError>;
+
+    fn unicast_hop_limit(&self) -> Result<u8, NetworkError>;
+    fn set_unicast_hop_limit(&mut self, value: u8) -> Result<(), NetworkError>;
+
+    fn receive_buffer_size(&self) -> Result<u64, NetworkError>;
+    fn set_receive_buffer_size(&mut self, value: u64) -> Result<(), NetworkError>;
+
+    fn send_buffer_size(&self) -> Result<u64, NetworkError>;
+    fn set_send_buffer_size(&mut self, value: u64) -> Result<(), NetworkError>;
+
+    fn shutdown(&mut self, how: Shutdown) -> Result<(), NetworkError>;
+
 }
 
-pub trait TableTcpSocketExt {
-    fn get_tcp_socket(&self, fd: u32) -> Result<&dyn WasiTcpSocket, Error>;
-    fn get_tcp_socket_mut(&mut self, fd: u32) -> Result<&mut Box<dyn WasiTcpSocket>, Error>;
-}
-impl TableTcpSocketExt for crate::table::Table {
-    fn get_tcp_socket(&self, fd: u32) -> Result<&dyn WasiTcpSocket, Error> {
-        self.get::<Box<dyn WasiTcpSocket>>(fd).map(|f| f.as_ref())
-    }
-    fn get_tcp_socket_mut(&mut self, fd: u32) -> Result<&mut Box<dyn WasiTcpSocket>, Error> {
-        self.get_mut::<Box<dyn WasiTcpSocket>>(fd)
-    }
-}
+// pub trait TableTcpSocketExt {
+//     fn get_tcp_socket(&self, fd: u32) -> Result<&dyn WasiTcpSocket, Error>;
+//     fn get_tcp_socket_mut(&mut self, fd: u32) -> Result<&mut Box<dyn WasiTcpSocket>, Error>;
+// }
+// impl TableTcpSocketExt for crate::table::Table {
+//     fn get_tcp_socket(&self, fd: u32) -> Result<&dyn WasiTcpSocket, Error> {
+//         self.get::<Box<dyn WasiTcpSocket>>(fd).map(|f| f.as_ref())
+//     }
+//     fn get_tcp_socket_mut(&mut self, fd: u32) -> Result<&mut Box<dyn WasiTcpSocket>, Error> {
+//         self.get_mut::<Box<dyn WasiTcpSocket>>(fd)
+//     }
+// }

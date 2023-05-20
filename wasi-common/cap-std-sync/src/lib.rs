@@ -61,14 +61,15 @@ pub struct WasiCtxBuilder(WasiCtx);
 
 impl WasiCtxBuilder {
     pub fn new() -> Self {
-        WasiCtxBuilder(WasiCtx::new(
-            random_ctx(),
-            clocks_ctx(),
-            sched_ctx(),
-            Table::new(),
-            Box::new(create_network),
-            Box::new(create_tcp_socket),
-        ))
+        // WasiCtxBuilder(WasiCtx::new(
+        //     random_ctx(),
+        //     clocks_ctx(),
+        //     sched_ctx(),
+        //     Table::new(),
+        //     Box::new(create_network),
+        //     Box::new(create_tcp_socket),
+        // ))
+        todo!()
     }
     pub fn stdin(mut self, f: Box<dyn InputStream>) -> Self {
         self.0.set_stdin(f);
@@ -106,27 +107,27 @@ impl WasiCtxBuilder {
         self.0.insert_dir(fd, dir);
         self
     }
-    pub fn preopened_listener(mut self, fd: u32, listener: impl Into<TcpSocket>) -> Self {
-        let listener: TcpSocket = listener.into();
-        let listener: Box<dyn WasiTcpSocket> = Box::new(TcpSocket::from(listener));
+    // pub fn preopened_listener(mut self, fd: u32, listener: impl Into<TcpSocket>) -> Self {
+    //     let listener: TcpSocket = listener.into();
+    //     let listener: Box<dyn WasiTcpSocket> = Box::new(TcpSocket::from(listener));
 
-        self.0.insert_listener(fd, listener);
-        self
-    }
+    //     self.0.insert_listener(fd, listener);
+    //     self
+    // }
     pub fn build(self) -> WasiCtx {
         self.0
     }
 }
 
-fn create_network(pool: Pool) -> Result<Box<dyn WasiNetwork>, Error> {
-    let network: Box<dyn WasiNetwork> = Box::new(Network::new(pool));
-    Ok(network)
-}
+// fn create_network(pool: Pool) -> Result<Box<dyn WasiNetwork>, Error> {
+//     let network: Box<dyn WasiNetwork> = Box::new(Network::new(pool));
+//     Ok(network)
+// }
 
-fn create_tcp_socket(address_family: AddressFamily) -> Result<Box<dyn WasiTcpSocket>, Error> {
-    let socket: Box<dyn WasiTcpSocket> = Box::new(TcpSocket::new(address_family));
-    Ok(socket)
-}
+// fn create_tcp_socket(address_family: AddressFamily) -> Result<Box<dyn WasiTcpSocket>, Error> {
+//     let socket: Box<dyn WasiTcpSocket> = Box::new(TcpSocket::new(address_family));
+//     Ok(socket)
+// }
 
 pub fn random_ctx() -> Box<dyn RngCore + Send + Sync> {
     let mut rng = cap_rand::thread_rng(cap_rand::ambient_authority());
